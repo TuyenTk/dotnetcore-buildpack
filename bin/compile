@@ -1,91 +1,56 @@
 #!/usr/bin/env bash
+# bin/compile <build-dir> <cache-dir> <env-dir>
 
-function install_dotnet() {
-  local BUILD_DIR="$1"
-  local CACHE_DIR="$2"
-  local ZIP_NAME="dotnet-2.1.200.tar.gz"
+### Configure environment
+set -o errexit    # always exit on error
+set -o pipefail   # don't ignore exit codes when piping output
+set -o nounset    # fail on unset variables
+unset GIT_DIR     # Avoid GIT_DIR leak from previous build steps
 
-  if [ ! -f $CACHE_DIR/$ZIP_NAME ]; then
-    # https://github.com/dotnet/core/blob/master/release-notes/download-archives/2.1.200-sdk-download.md
-    curl -sSL -o $CACHE_DIR/$ZIP_NAME https://download.microsoft.com/download/3/7/1/37189942-C91D-46E9-907B-CF2B2DE584C7/dotnet-sdk-2.1.200-linux-x64.tar.gz
-  else
-    echo "$ZIP_NAME from cache folder"
-  fi
+if [ "$STACK" != "heroku-16" ]; then
+	echo "Need heroku-16 stack"
+	exit 1
+fi
 
-  mkdir -p ${BUILD_DIR}/.heroku/dotnet && tar zxf $CACHE_DIR/$ZIP_NAME -C ${BUILD_DIR}/.heroku/dotnet
-  ln -s ${BUILD_DIR}/.heroku/dotnet /app
-}
+### Configure directories
+BUILD_DIR=${1:-}
+CACHE_DIR=${2:-}
+ENV_DIR=${3:-}
+BP_DIR=$(cd $(dirname ${0:-}); cd ..; pwd)
 
-# https://github.com/ddollar/heroku-buildpack-apt
-function topic() {
-  echo "-----> $*"
-}
+mkdir -p $BUILD_DIR/.profile.d
+cp $BP_DIR/profile/* $BUILD_DIR/.profile.d/
 
-function indent() {
-  c='s/^/       /'
-  case $(uname) in
-    Darwin) sed -l "$c";;
-    *)      sed -u "$c";;
-  esac
-}
+### Load dependencies
+source $BP_DIR/lib/utils
 
-function apt_install(){
-  echo "Install package"
+export_env_dir $ENV_DIR
+export DOTNET_SKIP_FIRST_TIME_EXPERIENCE=${DOTNET_SKIP_FIRST_TIME_EXPERIENCE:-1}
+export DOTNET_CLI_TELEMETRY_OPTOUT=${DOTNET_CLI_TELEMETRY_OPTOUT:-1}
 
-  local apt_cache_dir="$CACHE_DIR/apt/cache"
-  local apt_state_dir="$CACHE_DIR/apt/state"
-  
-  mkdir -p "$apt_cache_dir/archives/partial"
-  mkdir -p "$apt_state_dir/lists/partial"
-  
-  local apt_options="-o debug::nolocking=true -o dir::cache=$apt_cache_dir -o dir::state=$apt_state_dir"
-  
-  topic "Cleaning apt caches"
-  apt-get $apt_options clean | indent
-  
-  topic "Updating apt caches"
-  apt-get  --allow-unauthenticated $apt_options update | indent
+echo "Installing the dependencies"
+apt_install libunwind8 gettext libgdiplus
 
-  for package in "$@"; do
-    if [[ $package == *deb ]]; then
-      local package_name=$(basename $package .deb)
-      local package_file=$apt_cache_dir/archives/$package_name.deb
-      topic "Fetching $package"
-      curl -s -L -z $package_file -o $package_file $package 2>&1 | indent
-    else
-      topic "Fetching .debs for $package"
-      apt-get $apt_options -y --allow-downgrades --allow-remove-essential --allow-change-held-packages -d install --reinstall $package | indent
-    fi
-  done
-  
-  mkdir -p "$BUILD_DIR/.apt"
+echo "Installing dotnet"
+install_dotnet $BUILD_DIR $CACHE_DIR
 
-  for DEB in $(ls -1 $apt_cache_dir/archives/*.deb); do
-    topic "Installing $(basename $DEB)"
-    dpkg -x $DEB "$BUILD_DIR/.apt/"
-  done
-  
-  export PATH="$PATH:$BUILD_DIR/.apt/usr/bin"
-  export LD_LIBRARY_PATH="$BUILD_DIR/.apt/usr/lib/x86_64-linux-gnu:$BUILD_DIR/.apt/usr/lib/i386-linux-gnu:$BUILD_DIR/.apt/usr/lib:${LD_LIBRARY_PATH-}"
-  export LIBRARY_PATH="$BUILD_DIR/.apt/usr/lib/x86_64-linux-gnu:$BUILD_DIR/.apt/usr/lib/i386-linux-gnu:$BUILD_DIR/.apt/usr/lib:${LIBRARY_PATH-}"
-  export INCLUDE_PATH="$BUILD_DIR/.apt/usr/include:${INCLUDE_PATH-}"
-  export CPATH="${INCLUDE_PATH-}"
-  export CPPPATH="${INCLUDE_PATH-}"
-  export PKG_CONFIG_PATH="$BUILD_DIR/.apt/usr/lib/x86_64-linux-gnu/pkgconfig:$BUILD_DIR/.apt/usr/lib/i386-linux-gnu/pkgconfig:$BUILD_DIR/.apt/usr/lib/pkgconfig:${PKG_CONFIG_PATH-}"
-  echo "APT packages Installled"
-}
+export PATH="/app/dotnet:${PATH}"
+export LD_LIBRARY_PATH="${LD_LIBRARY_PATH}"
 
-export_env_dir() {
-  local env_dir=$1
-  if [ -d "$env_dir" ]; then
-    local whitelist_regex=${2:-''}
-    local blacklist_regex=${3:-'^(PATH|GIT_DIR|CPATH|CPPATH|LD_PRELOAD|LIBRARY_PATH|LANG)$'}
-    if [ -d "$env_dir" ]; then
-      for e in $(ls $env_dir); do
-        echo "$e" | grep -E "$whitelist_regex" | grep -qvE "$blacklist_regex" &&
-        export "$e=$(cat $env_dir/$e)"
-        :
-      done
-    fi
-  fi
-}
+cd $BUILD_DIR
+dotnet --info
+
+if [ -z ${PROJECT_FILE:-} ]; then
+	PROJECT_FILE=$(x=$(dirname $(find ${BUILD_DIR} -maxdepth 5 -iname Startup.cs | head -1)); while [[ "$x" =~ $BUILD_DIR ]] ; do find "$x" -maxdepth 1 -name *.csproj; x=`dirname "$x"`; done)
+fi
+
+if [ -z ${PROJECT_NAME:-} ]; then
+	PROJECT_NAME=$(basename ${PROJECT_FILE%.*})
+fi
+
+echo "publish ${PROJECT_FILE}"
+dotnet publish $PROJECT_FILE --output ${BUILD_DIR}/heroku_output --configuration Release --runtime linux-x64
+
+cat << EOT >> ${BUILD_DIR}/Procfile
+web: cd \$HOME/heroku_output && ASPNETCORE_URLS='http://+:\$PORT' dotnet "./${PROJECT_NAME}.dll"
+EOT
